@@ -95,4 +95,9 @@ const userSchema = new mongoose.Schema(
   }
 );
 
+// Performance indexes (email already has index from unique: true, so skip duplicate)
+userSchema.index({ status: 1 }); // Filter active users
+userSchema.index({ isBlocked: 1 }); // Filter blocked users
+userSchema.index({ createdAt: -1 }); // Sort by creation date
+
 module.exports = mongoose.model("user", userSchema);

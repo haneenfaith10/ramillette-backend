@@ -310,10 +310,17 @@ module.exports = {
       let calculatedSubtotal = 0;
 
       // -----------------------------------------
+      // 🔥 OPTIMIZATION: Fetch ALL products in ONE query instead of N+1
+      // -----------------------------------------
+      const productIds = cart.map(item => item.productId);
+      const products = await Product.find({ _id: { $in: productIds } });
+      const productMap = new Map(products.map(p => [p._id.toString(), p]));
+
+      // -----------------------------------------
       // 🔥 PROCESS EACH CART ITEM
       // -----------------------------------------
       for (const item of cart) {
-        const product = await Product.findById(item.productId);
+        const product = productMap.get(item.productId.toString());
         if (!product) {
           return res.status(404).json({
             isSuccess: false,
@@ -430,7 +437,7 @@ module.exports = {
         });
 
         // -----------------------------------------
-        // 🔥 UPDATE STOCK
+        // 🔥 UPDATE STOCK (using arrayFilters for Map-based updates)
         // -----------------------------------------
         const variantCountryEntry = Array.from(
           product.countryVariants.entries()
@@ -441,20 +448,17 @@ module.exports = {
         if (variantCountryEntry) {
           const countryKey = variantCountryEntry[0];
           const variantsArr = product.countryVariants.get(countryKey);
-
           const updatedVariants = variantsArr.map((v) =>
             v._id.toString() === variant._id.toString()
               ? { ...v._doc, stock: v.stock - item.qty }
               : v
           );
-
           product.countryVariants.set(countryKey, updatedVariants);
-          await product.save();
         }
       }
 
       // -----------------------------------------
-      // 🔥 VALIDATE SUBTOTAL TO AVOID HACKING
+      // 🔥 VALIDATE SUBTOTAL TO AVOID HACKING (before saving products)
       // -----------------------------------------
       if (Math.round(calculatedSubtotal) !== Math.round(subtotal)) {
         return res.status(400).json({
@@ -462,6 +466,11 @@ module.exports = {
           message: "Subtotal mismatch. Please refresh cart.",
         });
       }
+
+      // -----------------------------------------
+      // 🔥 BULK SAVE ALL PRODUCTS (optimized - saves all at once)
+      // -----------------------------------------
+      await Promise.all(products.map(p => p.save()));
 
       // -----------------------------------------
       // 🔥 APPLY NEW USER OFFER (cart-level)
@@ -519,19 +528,20 @@ module.exports = {
       userData.cart.totalPrice = 0;
       await userData.save();
 
-      // Send email
-      const companyData = await Settings.findOne({});
+      // Send email asynchronously (non-blocking)
       if (userData.email) {
-        const emailHtml = generateOrderConfirmationEmail(
-          { username: userData.firstName, email: userData.email },
-          savedOrder,
-          companyData
-        );
-        sendEmail({
-          email: userData.email,
-          subject: `Your Order #${savedOrder._id} has been confirmed!`,
-          html: emailHtml,
-        });
+        Settings.findOne({}).then(companyData => {
+          const emailHtml = generateOrderConfirmationEmail(
+            { username: userData.firstName, email: userData.email },
+            savedOrder,
+            companyData
+          );
+          sendEmail({
+            email: userData.email,
+            subject: `Your Order #${savedOrder._id} has been confirmed!`,
+            html: emailHtml,
+          }).catch(err => console.error("Email send error (non-critical):", err));
+        }).catch(err => console.error("Settings fetch error (non-critical):", err));
       }
 
       return res.status(200).json({
@@ -549,14 +559,19 @@ module.exports = {
   getUserOrders: async (req, res) => {
     try {
       const userId = req.userId;
-      const userData = await User.findById(userId);
+      const userData = await User.findById(userId).select("_id").lean();
 
       if (!userData) {
         return res.status(404).json({ error: "User not found." });
       }
-      const orders = await Order.find({ user: userData?._id })
-        .populate("orderItems.productId")
-        .sort({ createdAt: -1 });
+      const orders = await Order.find({ user: userData._id })
+        .populate({
+          path: "orderItems.productId",
+          select: "productName productImages productShortName"
+        })
+        .select("orderItems deliveryAddress totalPrice subTotalPrice discountedPrice tax status paymentMethod currency createdAt deliverySteps shippingMethod")
+        .sort({ createdAt: -1 })
+        .lean();
       res.status(200).json({
         isSuccess: true,
         message: "User orders fetched successfully",
